@@ -1,0 +1,27 @@
+<html>
+<head>
+    <title>Upload Torrent</title>
+    <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <h1>Upload Torrent</h1>
+  <input type="file" id="torrent">
+  <button onclick="uploadTorrent()">Upload</button>
+
+  <script>
+    async function uploadTorrent() {
+      const fileInput = document.getElementById('torrent');
+      const formData = new FormData();
+      formData.append('torrent', fileInput.files[0]);
+
+      const res = await fetch('/api/upload', {
+        method: 'POST',
+        body: formData
+      });
+
+      const data = await res.json();
+      alert(data.result || data.error);
+    }
+  </script>
+</body>
+</html>
