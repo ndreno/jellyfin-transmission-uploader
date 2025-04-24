@@ -2,6 +2,8 @@
 
 require('dotenv').config();
 const express = require('express');
+const session = require('express-session');
+const MemoryStore = require('memorystore')(session);
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
@@ -29,6 +31,9 @@ log.info(`TRANS_USER: ${process.env.TRANS_USER ? 'Set' : 'MISSING!'}`);
 log.info(`TRANS_PASS: ${process.env.TRANS_PASS ? 'Set (********)' : 'MISSING!'}`);
 if (!process.env.TRANSMISSION_URL || !process.env.TRANS_USER || !process.env.TRANS_PASS) {
     log.error('CRITICAL: Transmission environment variables (TRANSMISSION_URL, TRANS_USER, TRANS_PASS) are not fully set in .env file!');
+}
+if (!process.env.SESSION_SECRET) {
+    log.error('CRITICAL: SESSION_SECRET environment variable is not set! Using a weak default. Generate one and add to .env');
 }
 log.info('--- End Configuration ---');
 // --- End Environment Variable Check ---
@@ -61,7 +66,41 @@ const upload = multer({
 app.use(express.static('public'));
 app.use(express.json());
 
-// Jellyfin login
+// --- Session Configuration ---
+// WARNING: Use a proper session store (e.g., connect-mongo, connect-redis) for production!
+// MemoryStore will lose sessions on server restart.
+app.use(session({
+    cookie: {
+        maxAge: 86400000, // 1 day in milliseconds
+        // secure: process.env.NODE_ENV === 'production', // Use secure cookies in production (requires HTTPS)
+        // httpOnly: true, // Prevents client-side JS from reading the cookie
+        // sameSite: 'lax' // Protects against CSRF
+    },
+    store: new MemoryStore({
+        checkPeriod: 86400000 // prune expired entries every 24h
+    }),
+    resave: false, // Don't save session if unmodified
+    saveUninitialized: false, // Don't create session until something stored
+    secret: process.env.SESSION_SECRET || 'a-very-weak-secret-key-replace-me' // MUST set in .env!
+}));
+// --- End Session Configuration ---
+
+
+// --- Authentication Middleware ---
+function requireLogin(req, res, next) {
+  log.debug('Checking authentication status...');
+  if (req.session && req.session.userId) {
+    log.debug(`User authenticated (userId: ${req.session.userId}). Proceeding.`);
+    next(); // User is logged in, proceed
+  } else {
+    log.warn('Authentication required, but user not logged in. Blocking request.');
+    res.status(401).json({ error: 'Unauthorized. Please log in first.' }); // User not logged in
+  }
+}
+// --- End Authentication Middleware ---
+
+
+// Jellyfin login - Now stores user info in session
 app.post('/api/login', async (req, res) => {
   log.info('Received POST /api/login');
   const { username, password } = req.body;
@@ -72,14 +111,14 @@ app.post('/api/login', async (req, res) => {
       return res.status(400).json({ error: 'Username and password are required.' });
   }
 
-  log.debug(`Attempting Jellyfin login for user: ${username}`); // Avoid logging password
+  log.debug(`Attempting Jellyfin login for user: ${username}`);
   const loginUrl = `${jellyfinServer}/Users/AuthenticateByName`;
   log.debug(`Jellyfin Auth URL: ${loginUrl}`);
 
   try {
     const response = await axios.post(loginUrl, {
       Username: username,
-      Pw: password, // Sending password here
+      Pw: password,
     }, {
       headers: {
         'Content-Type': 'application/json',
@@ -87,31 +126,78 @@ app.post('/api/login', async (req, res) => {
       }
     });
     log.info(`Jellyfin login successful for user: ${username}`);
-    res.json({ token: response.data.AccessToken });
+
+    // --- Store user info in session on successful login ---
+    // Regenerate session ID to prevent session fixation
+    req.session.regenerate(function(err) {
+        if (err) {
+            log.error('Error regenerating session:', err);
+            return res.status(500).json({ error: 'Login failed during session setup.' });
+        }
+        req.session.userId = response.data.User.Id; // Store Jellyfin User ID
+        req.session.username = response.data.User.Name; // Store username
+        req.session.jellyfinToken = response.data.AccessToken; // Store Jellyfin token (optional)
+        log.debug(`User ${req.session.username} (ID: ${req.session.userId}) saved to session.`);
+
+        // Send response *after* session is saved
+        res.json({ token: response.data.AccessToken }); // Still return token if client needs it directly
+    });
+    // --- End storing session ---
+
   } catch (error) {
     log.error(`Jellyfin authentication failed for user: ${username}`);
     if (error.response) {
-      // The request was made and the server responded with a status code
-      // that falls out of the range of 2xx
       log.error('Error Response Data:', error.response.data);
       log.error('Error Response Status:', error.response.status);
-      log.error('Error Response Headers:', error.response.headers);
       res.status(error.response.status || 401).json({ error: 'Authentication failed', details: error.response.data });
     } else if (error.request) {
-      // The request was made but no response was received
       log.error('Error Request:', error.request);
       res.status(500).json({ error: 'Authentication failed - No response from Jellyfin server' });
     } else {
-      // Something happened in setting up the request that triggered an Error
       log.error('Error Message:', error.message);
       res.status(500).json({ error: 'Authentication failed - Client setup error' });
     }
   }
 });
 
-// Upload and send torrent to Transmission
-app.post('/api/upload', upload.single('torrent'), async (req, res) => {
-  log.info('Received POST /api/upload');
+// Endpoint to check login status
+app.get('/api/status', (req, res) => {
+    if (req.session && req.session.userId) {
+        log.debug(`Status check: User ${req.session.username} is logged in.`);
+        res.json({ loggedIn: true, username: req.session.username });
+    } else {
+        log.debug('Status check: User is not logged in.');
+        res.json({ loggedIn: false });
+    }
+});
+
+// Logout endpoint
+app.post('/api/logout', (req, res) => {
+    const username = req.session?.username;
+    log.info(`Received POST /api/logout for user: ${username || 'Unknown/Not logged in'}`);
+    if (req.session) {
+        req.session.destroy(err => {
+            if (err) {
+                log.error('Error destroying session:', err);
+                return res.status(500).json({ error: 'Could not log out.' });
+            }
+            // Optional: Clear the cookie on the client side too
+            // The default cookie name used by express-session is 'connect.sid'
+            res.clearCookie('connect.sid');
+            log.info(`Session destroyed successfully for user: ${username || 'Unknown'}`);
+            res.status(200).json({ message: 'Logged out successfully.' });
+        });
+    } else {
+        res.status(200).json({ message: 'No active session to log out from.' });
+    }
+});
+
+
+// Upload and send torrent to Transmission (PROTECTED)
+// Apply the requireLogin middleware BEFORE the upload handler
+app.post('/api/upload', requireLogin, upload.single('torrent'), async (req, res) => {
+  // This code will only run if requireLogin calls next()
+  log.info(`Received POST /api/upload request from authenticated user: ${req.session.username}`);
 
   if (!req.file) {
     log.error('Upload failed: No file received in the request.');
@@ -119,16 +205,7 @@ app.post('/api/upload', upload.single('torrent'), async (req, res) => {
   }
 
   const torrentPath = req.file.path;
-  log.debug(`File uploaded successfully. Details:`, {
-      fieldname: req.file.fieldname,
-      originalname: req.file.originalname,
-      encoding: req.file.encoding,
-      mimetype: req.file.mimetype,
-      destination: req.file.destination,
-      filename: req.file.filename,
-      path: req.file.path,
-      size: req.file.size
-  });
+  log.debug(`File uploaded successfully. Details:`, { /* ... file details ... */ });
 
   // --- Transmission Credentials Check ---
   const transUrl = process.env.TRANSMISSION_URL;
@@ -137,7 +214,8 @@ app.post('/api/upload', upload.single('torrent'), async (req, res) => {
 
   if (!transUrl || !transUser || !transPass) {
       log.error('Transmission credentials or URL are missing in environment variables.');
-      fs.unlink(torrentPath, (err) => { // Use async unlink
+      // Clean up uploaded file if config is bad
+      fs.unlink(torrentPath, (err) => {
           if (err) log.error(`Failed to delete temp file ${torrentPath} after config error:`, err);
           else log.debug(`Deleted temp file ${torrentPath} after config error.`);
       });
@@ -145,14 +223,14 @@ app.post('/api/upload', upload.single('torrent'), async (req, res) => {
   }
   // --- End Credentials Check ---
 
-  let sessionId = null; // Define sessionId outside try blocks
+  let sessionId = null;
 
   try {
     log.debug(`Reading torrent file from path: ${torrentPath}`);
     const torrentData = fs.readFileSync(torrentPath);
     log.debug(`Torrent file read successfully, size: ${torrentData.length} bytes.`);
     const base64Torrent = torrentData.toString('base64');
-    log.debug(`Torrent data encoded to base64 (length: ${base64Torrent.length}).`);
+    log.debug(`Torrent data encoded to base64.`);
 
     const rpcUrl = `${transUrl}/transmission/rpc`;
     const auth = { username: transUser, password: transPass };
@@ -162,26 +240,17 @@ app.post('/api/upload', upload.single('torrent'), async (req, res) => {
     try {
         // Make a preliminary request which is expected to fail with 409 Conflict
         await axios.post(rpcUrl, {}, { auth });
-        // If it doesn't fail, something is unusual, but maybe it works? Log a warning.
-        log.warn('Initial request to Transmission did not return 409, proceeding anyway.');
-        // In this unusual case, we assume no session ID needed or it's handled differently.
-        // For safety, let's try getting it from a potential header anyway if the lib supports it (unlikely).
-        // sessionId = sessionResp?.headers?.['x-transmission-session-id']; // Might be undefined
-
+        log.warn('Initial request to Transmission did not return 409, proceeding anyway (unusual).');
     } catch (error) {
         if (error.response && error.response.status === 409) {
-            // This is the EXPECTED path
             sessionId = error.response.headers['x-transmission-session-id'];
             if (sessionId) {
                 log.info(`Successfully obtained Transmission session ID.`);
-                log.debug(`Session ID: ${sessionId}`); // Be careful logging sensitive IDs in prod
             } else {
                 log.error('Received 409 Conflict from Transmission, but X-Transmission-Session-Id header was MISSING!');
-                log.error('Transmission Response Headers:', error.response.headers);
                 throw new Error('Failed to get Transmission session ID header despite 409 response.');
             }
         } else {
-            // An UNEXPECTED error occurred trying to get the session ID
             log.error('Unexpected error while trying to get Transmission session ID.');
             if (error.response) {
                 log.error('Error Response Status:', error.response.status);
@@ -193,15 +262,9 @@ app.post('/api/upload', upload.single('torrent'), async (req, res) => {
         }
     }
 
-    // Ensure we have a session ID before proceeding
     if (!sessionId) {
-         log.error("Failed to obtain Transmission session ID. Cannot proceed with torrent addition.");
-         // Clean up the uploaded file
-         fs.unlink(torrentPath, (err) => {
-            if (err) log.error(`Failed to delete temp file ${torrentPath} after session ID failure:`, err);
-            else log.debug(`Deleted temp file ${torrentPath} after session ID failure.`);
-         });
-         return res.status(500).json({ error: 'Failed to communicate with Transmission: Could not get session ID.' });
+         log.error("Failed to obtain Transmission session ID. Cannot proceed.");
+         throw new Error('Failed to communicate with Transmission: Could not get session ID.');
     }
 
     // --- Step 2: Send Torrent to Transmission ---
@@ -210,7 +273,6 @@ app.post('/api/upload', upload.single('torrent'), async (req, res) => {
       method: 'torrent-add',
       arguments: { metainfo: base64Torrent }
     };
-    log.debug('Transmission request payload:', { method: payload.method, arguments: { metainfo: `base64_string_length_${base64Torrent.length}` } }); // Don't log the full base64 string
 
     const addResp = await axios.post(rpcUrl, payload, {
       headers: { 'X-Transmission-Session-Id': sessionId },
@@ -221,10 +283,9 @@ app.post('/api/upload', upload.single('torrent'), async (req, res) => {
     log.debug('Transmission add response status:', addResp.status);
     log.debug('Transmission add response data:', addResp.data);
 
-    // Check Transmission's response result
     if (addResp.data.result === 'success') {
         log.info('Transmission confirmed torrent addition success.');
-        res.json({ result: 'success', details: addResp.data.arguments }); // Send back success and any details
+        res.json({ result: 'success', details: addResp.data.arguments });
     } else {
         log.warn(`Transmission reported non-success result: ${addResp.data.result}`);
         res.status(400).json({ error: 'Transmission reported an issue adding the torrent.', details: addResp.data });
@@ -233,19 +294,14 @@ app.post('/api/upload', upload.single('torrent'), async (req, res) => {
   } catch (err) {
     log.error('An error occurred during the torrent upload process:');
     if (err.response) {
-        // Error from Axios request (likely to Transmission add call)
         log.error('Axios Response Error Status:', err.response.status);
         log.error('Axios Response Error Data:', err.response.data);
-        log.error('Axios Response Error Headers:', err.response.headers);
         res.status(err.response.status || 500).json({ error: 'Failed to send torrent to Transmission', details: err.response.data });
     } else if (err.request) {
-        // Request made but no response received
         log.error('Axios Request Error: No response received.', err.request);
         res.status(504).json({ error: 'Failed to send torrent to Transmission: No response' });
     } else {
-        // Setup error or other synchronous error (e.g., fs.readFileSync)
         log.error('Error Message:', err.message);
-        log.error('Error Stack:', err.stack); // Log stack trace for other errors
         res.status(500).json({ error: 'Internal server error during torrent processing.' });
     }
   } finally {
